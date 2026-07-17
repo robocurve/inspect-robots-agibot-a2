@@ -19,6 +19,9 @@ from inspect_robots_agibot_a2.config import (
     observation_space,
 )
 
+# Advisory chunk metadata: the A2 wire convention is 30 Hz (unread by rollout).
+CONTROL_HZ_METADATA = 30.0
+
 OPENPI_CLIENT_INSTALL_COMMAND = (
     'pip install "openpi-client @ '
     "git+https://github.com/Physical-Intelligence/openpi.git"
@@ -221,6 +224,6 @@ class OpenpiPolicy:
         self.num_inferences += 1
         return ActionChunk(
             actions=[Action(data=row.copy()) for row in actions],
-            control_hz=30.0,
+            control_hz=CONTROL_HZ_METADATA,
             inference_latency_s=elapsed,
         )

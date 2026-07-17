@@ -256,6 +256,7 @@ def test_step_hard_clamps_bounds_without_approver(scene: Scene) -> None:
 def test_grippers_are_excluded_from_rad_per_second_cap(scene: Scene) -> None:
     driver = FakeDriver()
     cfg = A2Config(unattended=True, max_joint_speed=0.0001)
+    driver.arms = packing.arm_slots(np.asarray(cfg.home_pose, dtype=np.float64))
     embodiment = _reset(driver, scene, cfg=cfg)
     target = _home()
     target[7] = 0.123
@@ -468,3 +469,57 @@ def test_runtime_requirements_are_mapping_and_reported(monkeypatch: pytest.Monke
     monkeypatch.setattr("importlib.util.find_spec", lambda _name: None)
     assert missing_runtime_requirements(A2Embodiment) == A2Embodiment.RUNTIME_REQUIREMENTS
     assert A2Embodiment.DEVICE_SLOTS == ()
+
+
+def test_step_rejects_non_finite_actions(scene: Scene) -> None:
+    driver = FakeDriver()
+    embodiment = _reset(driver, scene)
+    published_before = len(driver.arm_commands)
+    bad = _home()
+    bad[3] = float("nan")
+    with pytest.raises(ValueError, match="finite"):
+        embodiment.step(Action(data=bad))
+    assert len(driver.arm_commands) == published_before
+
+
+def test_homing_ramp_raises_when_cap_rounds_to_zero(scene: Scene) -> None:
+    driver = FakeDriver()
+    home = _home()
+    home[0] = 1.5
+    cfg = A2Config(unattended=True, max_joint_speed=1e-15, home_pose=tuple(home))
+    driver.arms = packing.arm_slots(_home())
+    driver.arms[0] = 1.0
+    with pytest.raises(RuntimeError, match="no progress"):
+        _reset(driver, scene, cfg=cfg)
+
+
+def test_reset_seeds_baseline_after_operator_wait(scene: Scene) -> None:
+    driver = FakeDriver()
+    moved = packing.arm_slots(_home())
+    moved[0] = 0.4
+
+    prompts: list[str] = []
+
+    def input_fn(prompt: str = "") -> str:
+        prompts.append(prompt)
+        if len(prompts) == 1:
+            driver.arms = moved.copy()
+        return ""
+
+    timer = FakeTime()
+    embodiment = A2Embodiment(
+        A2Config(unattended=False),
+        driver_factory=lambda _cfg: driver,
+        mode_client=FakeModeClient(),
+        operator=OperatorIO(input_fn=input_fn, output_fn=lambda _msg: None),
+        poll_end=lambda: False,
+        clock=timer.clock,
+        sleep_fn=timer.sleep,
+    )
+    embodiment.reset(scene)
+    # The ramp must start from the pose observed AFTER the stand-clear wait
+    # (0.4 was set during the prompt), so the first published command departs
+    # from 0.4 toward home, never from the stale pre-wait zero.
+    first = driver.arm_commands[0][0]
+    assert 0.0 < abs(first - 0.4) < 0.4
+    assert first != pytest.approx(0.0)

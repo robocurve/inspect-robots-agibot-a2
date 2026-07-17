@@ -322,11 +322,14 @@ class A2Embodiment:
             self._driver = self._driver_factory(self._cfg)
         if self._cfg.require_servo_mode:
             self._enter_servo_mode()
-        self._seed_baseline()
         if not self._cfg.unattended:
             self._operator.wait_ready(
                 "Arms will move to the home pose. Stand clear, then press Enter..."
             )
+        # Seed after the human wait: the arm may sag or be repositioned while
+        # the operator holds the prompt, and ramps must start from the pose
+        # the arm actually holds when motion begins.
+        self._seed_baseline()
         home = packing.validate_dim(self._cfg.home_pose)
         self._ramp_arm_to(home)
         self._publish_hands(home, force=True)
@@ -346,6 +349,8 @@ class A2Embodiment:
         self._require_driver()
         baseline = self._require_baseline().copy()
         requested = packing.validate_dim(action.data)
+        if not np.isfinite(requested).all():
+            raise ValueError("action must contain only finite values")
         target = np.clip(requested, self._cfg.low, self._cfg.high)
         rate_limited = False
         for index in range(1, self._cfg.micro_commands + 1):
@@ -450,7 +455,13 @@ class A2Embodiment:
         revolute = np.ones(packing.TOTAL_DIM, dtype=bool)
         revolute[list(packing.GRIPPER_IDXS)] = False
         while np.any(np.abs(destination[revolute] - self._require_baseline()[revolute]) > 0):
+            before = self._require_baseline().copy()
             self._publish_arm_capped(destination)
+            if np.array_equal(self._require_baseline(), before):
+                raise RuntimeError(
+                    "homing ramp made no progress; per-micro-command cap rounds "
+                    "to zero at this max_joint_speed/stream rate combination"
+                )
 
     def _publish_hands(self, target: npt.ArrayLike, *, force: bool = False) -> None:
         driver = self._require_driver()
