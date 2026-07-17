@@ -1,0 +1,164 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: lint · type
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            **/pyproject.toml
+            **/uv.lock
+      - name: Install from uv.lock (dev extras)
+        run: uv sync --locked --python 3.11 --extra dev
+      - name: Ruff (lint)
+        run: uv run ruff check .
+      - name: Ruff (format check)
+        run: uv run ruff format --check .
+      - name: Mypy (strict)
+        run: uv run mypy
+
+  test:
+    name: test (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            **/pyproject.toml
+            **/uv.lock
+      - name: Install from uv.lock (dev extras)
+        run: uv sync --locked --python ${{ matrix.python-version }} --extra dev
+      - name: Pytest (100% coverage)
+        run: uv run pytest --cov --cov-report=term-missing
+
+  import-hygiene:
+    name: import with minimal dependencies
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            **/pyproject.toml
+            **/uv.lock
+      - name: Install package with only locked core pins
+        run: |
+          uv venv --python 3.12
+          uv pip install --no-deps .
+          uv export --locked --no-emit-project --no-hashes \
+            | grep -E '^(inspect-robots|numpy)==' > /tmp/minimal-locked.txt
+          uv pip install -r /tmp/minimal-locked.txt
+      - name: Assert integrations absent, then import
+        run: |
+          .venv/bin/python - <<'PY'
+          import importlib.util
+          for mod in (
+              "requests",
+              "json_numpy",
+              "rclpy",
+              "openpi_client",
+              "websockets",
+              "torch",
+          ):
+              assert importlib.util.find_spec(mod) is None, f"{mod} unexpectedly installed"
+          import inspect_robots_agibot_a2
+          print(
+              "inspect_robots_agibot_a2",
+              inspect_robots_agibot_a2.__version__,
+              "imported with minimal deps",
+          )
+          PY
+
+  openpi-seam:
+    name: real openpi client import seam
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+      - name: Install package and Physical Intelligence client
+        run: |
+          uv venv --python 3.12
+          uv pip install -e ".[dev]"
+          uv pip install "openpi-client @ git+https://github.com/Physical-Intelligence/openpi.git#subdirectory=packages/openpi-client"
+      - name: Import every symbol used by the real transport
+        run: |
+          uv run --no-sync python - <<'PY'
+          import inspect
+
+          from openpi_client import image_tools, websocket_client_policy
+
+          init_params = inspect.signature(
+              websocket_client_policy.WebsocketClientPolicy.__init__
+          ).parameters
+          for name in ("host", "port", "api_key"):
+              assert name in init_params, f"WebsocketClientPolicy lost kwarg {name!r}"
+          assert callable(websocket_client_policy.WebsocketClientPolicy.infer)
+          resize_params = list(inspect.signature(image_tools.resize_with_pad).parameters)
+          assert resize_params[:3] == ["images", "height", "width"], resize_params
+          PY
+
+  ci-ok:
+    name: ci-ok
+    if: ${{ always() }}
+    needs: [quality, test, import-hygiene, openpi-seam]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail unless every needed job succeeded
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: echo "$RESULTS" | jq -e 'all(.[]; .result == "success")'
+
+  alert-red-main:
+    name: alert on red main
+    if: ${{ failure() && github.event_name == 'push' }}
+    needs: [quality, test, import-hygiene, openpi-seam]
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Open an issue unless one is already open
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          existing=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "CI is red on main in:title" --json number --jq length)
+          if [ "$existing" = "0" ]; then
+            gh issue create -R "$GITHUB_REPOSITORY" \
+              --title "CI is red on main (${GITHUB_SHA:0:8})" \
+              --body "CI failed on a push to main: $RUN_URL. Stop the line: fix forward or revert before merging anything else. If the failure is transient, re-run the failed jobs and close this issue."
+          else
+            echo "an open red-main issue already exists; not filing another"
+          fi
