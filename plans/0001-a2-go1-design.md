@@ -37,13 +37,22 @@ DROID-style conversions).
     `/aima/hal/fish_eye_camera/chest_{left,right}/color` (640x480@30).
     No wrist cameras on A2 Ultra.
 - **Mode gating**: arm streaming requires an action state (for example
-  `PASSIVE_UPPER_BODY_JOINT_SERVO`) set through the
-  `aimdk.protocol.McActionService/SetAction` HTTP JSON-RPC on the x86 host
-  (`http://192.168.100.100:56322`), and `disable_motion_player.sh` must have
-  been run. The exact SetAction JSON body is not fully pinned by public
-  docs: the mode client is therefore its own injectable seam with a
-  documented provisional default (see Driver contract), flagged in the
-  README as needing on-robot confirmation.
+  `PASSIVE_UPPER_BODY_JOINT_SERVO`). The v1.3 docs pin the RPC exactly
+  (hardcode it, cite the doc, keep a your-software-version caveat for the
+  v2.1 churn): `POST
+  http://192.168.100.100:56322/rpc/aimdk.protocol.McActionService/SetAction`
+  with body `{"header": {"timestamp": ..., "control_source":
+  "ControlSource_SAFE"}, "command": {"action": "McAction_USE_EXT_CMD",
+  "ext_action": "<state>"}}`. `mode_rpc_url` is the BASE url; the client
+  joins `/rpc/aimdk.protocol.McActionService/<method>` itself. SetAction
+  is asynchronous: the default client polls `GetAction` until the target
+  state is reached (bounded retries, injected sleep) instead of
+  fire-and-forget. Separately, the built-in motion player must be
+  disabled; that is its own documented RPC on a DIFFERENT port
+  (`POST http://192.168.100.100:56444/rpc/aimdk.protocol.MotionCommandService/DisableMotionPlayer`
+  with `{}`): the README robot-setup section shows the curl, and the
+  docs' multi-port service layout is noted. The mode client stays an
+  injectable seam.
 - **No vendor Python package exists.** The driver imports `rclpy` lazily
   (guided-install error: system ROS 2 Humble, `ROS_DOMAIN_ID=232`,
   `ROS_LOCALHOST_ONLY=0`, FastRTPS profile from the robot image; rclpy is
@@ -52,13 +61,25 @@ DROID-style conversions).
   raw decode) to avoid a cv_bridge dependency.
 - **Policies:**
   - `go1`: HTTP client for GO-1 policy servers (AgiBot-World
-    `evaluate/deploy.py --port 9000`): `POST /act` JSON with keys
-    `top, right, left, instruction, state, ctrl_freqs`. GO-1 weights are
-    CC BY-NC-SA (research-only): the README states we ship only a client
-    and users must respect the model license. The exact image encoding in
-    the JSON body (lists vs base64) must be read off AgiBot-World's
-    deploy.py by the implementer before coding the default transport; the
-    transport is behind a `post_fn` seam either way.
+    `evaluate/deploy.py --port 9000`). Wire contract, verified against the
+    AgiBot-World repo (hardcode these; no implementer re-verification):
+    `POST /act` with a json_numpy-encoded body (`json_numpy.patch()`
+    server-side; images and state travel as encoded ndarrays), keys
+    `top, right, left, instruction, state, ctrl_freqs` where `ctrl_freqs`
+    is `np.asarray([cfg.ctrl_freqs])` (the server calls
+    `torch.from_numpy(payload["ctrl_freqs"].copy())`). The response is a
+    BARE JSON list (`actions.tolist()`), not a dict: `post_fn(url,
+    payload) -> np.ndarray` parses it. `json-numpy` joins the base deps
+    (lazily imported, yam precedent). GO-1 weights are CC BY-NC-SA
+    (research-only): the README states we ship only a client and users
+    must respect the model license.
+  - **State/action layout is normative, not transcribed.** GO-1's
+    state_dim/action_dim are per-checkpoint config (the repo has 8/7 and
+    14/14 examples and no A2 config at all), so there is nothing to copy:
+    this package's 16-D packing order and 1=open gripper polarity ARE the
+    documented wire convention for A2 GO-1 fine-tunes
+    (state_dim=action_dim=16), stated in config.py docstrings and the
+    README's fine-tuning note. No reorder/polarity hooks in v1.
   - `openpi`: websocket client identical in shape to inspect-robots-franka's
     (msgpack-numpy transport via the git-only openpi-client, guided
     install), registered as a second entry point for bring-your-own
@@ -74,7 +95,7 @@ DROID-style conversions).
 
 ## The 16-D contract
 
-yam-style interleaved bimanual packing, single source of truth in
+Blockwise left-then-right packing (yam-style: left arm block then right arm block, NOT per-joint interleaving), single source of truth in
 `packing.py` + `config.py` shared builders.
 
 - `DIM_LABELS = ("left_j1".."left_j7", "left_gripper",
@@ -88,12 +109,15 @@ yam-style interleaved bimanual packing, single source of truth in
   wire) * 2000)` commanded (AimDK counts are 0 = open, so the conversion is
   an inversion plus scale; tests use asymmetric values so a sign error
   cannot cancel).
-- Gripper collapse semantics: one normalized scalar per hand commands all
-  six flexion joints of that hand with the same converted count (a power
-  grasp scalar, the AgiBot World "gripper" convention approximation);
-  observation reads back the mean of the six flexion counts, renormalized.
-  Thumb swing joints (`L/R_thumb_swing`) are held at a configurable fixed
-  count (`thumb_swing_count`, default 0). Documented prominently: this is a
+- Gripper collapse semantics: each hand has 1 thumb-swing + FIVE flexion
+  joints (`thumb_1, index_1, middle_1, ring_1, little_1`); the documented
+  12-name wire order (thumb_swing first per hand) is pinned as a constant
+  in packing.py. One normalized scalar per hand commands the five flexion
+  joints with the same converted count (a power-grasp scalar, the AgiBot
+  World "gripper" convention approximation); observation reads back the
+  mean of the five flexion counts (swing excluded), renormalized. Thumb
+  swing joints are held at a configurable fixed count
+  (`thumb_swing_count`, default 0). Documented prominently: this is a
   deliberate v1 simplification.
 - `ActionSemantics(control_mode="joint_pos", rotation_repr="none",
   gripper="continuous", frame="base", dim_labels=DIM_LABELS)`.
@@ -106,23 +130,49 @@ yam-style interleaved bimanual packing, single source of truth in
   the full table from the AimDK motion-control page and cites it in
   config.py; README shows the table and tells users to verify against
   their robot's software version (docs churn v1.3 -> v2.1).
-- Default home pose: all revolute slots 0.0, grippers 1.0 (open), pending
-  the same doc check; conservative and config-overridable.
+- Default home pose: zero everywhere EXCEPT the elbows, which must sit
+  inside the documented asymmetric J4 limits (left J4 in [-2.00, -0.03],
+  right J4 in [0.03, 2.00]; zero is outside both): defaults left J4 =
+  -1.0, right J4 = +1.0, all other revolute slots 0.0, grippers 1.0
+  (open). A dedicated test asserts `A2Config()` constructs with pure
+  defaults (home and any rest pose inside limits, stream ratio valid), so
+  default-config construction can never regress.
 - `control_hz=30.0` (AgiBot World dataset rate) with **intra-step
-  interpolation**: the AimDK guidance wants command gaps <= 0.03 s, which a
-  30 Hz step cadence alone violates at the margin. `step()` therefore
-  publishes `stream_hz/control_hz` (default `stream_hz=100.0`) linearly
-  interpolated micro-commands between the previous clamped target and the
-  new one, paced by the injected sleep/clock, all synchronously inside
-  `step()` (no background thread; fully testable with fakes). The declared
-  contract stays `joint_pos` at 30 Hz; interpolation is a transport detail
-  documented in the README. A first-order low-pass on top is deliberately
-  omitted (interpolation already bounds slew; one smoothing stage keeps the
-  semantics inspectable).
-- Rate clamp: per-micro-command joint delta is capped at `3.0 rad/s /
-  stream_hz` per the documented velocity limit; the cap is enforced in the
-  embodiment (safety backstop layer, independent of any Approver) in
-  addition to the absolute joint-limit clamp.
+  interpolation**. The docs make 0.03 s the MAXIMUM inter-command gap (a
+  requirement, with 100 Hz recommended), so `step()` publishes
+  `n = ceil(stream_hz / control_hz)` linearly interpolated micro-commands
+  per step (defaults: stream_hz=100.0, control_hz=30.0 -> n=4, ~8.3 ms
+  gaps), paced at `1/(control_hz * n)` by the injected sleep/clock, all
+  synchronously inside `step()` (no background thread; fully testable
+  with fakes). No integer-multiple constraint: the ceil rule IS the spec.
+  The declared contract stays `joint_pos` at 30 Hz; interpolation is a
+  transport detail documented in the README. A first-order low-pass is
+  deliberately omitted (interpolation already bounds slew).
+- Rate clamp semantics (pinned so the implementer cannot guess wrong):
+  the per-micro-command revolute delta cap is `max_joint_speed /
+  (control_hz * n)` and is applied RELATIVE TO THE LAST PUBLISHED
+  micro-command; the next step's interpolation baseline is likewise the
+  last PUBLISHED command (never the last requested target), so the
+  command stream is always continuous and the cap can never silently
+  detach the baseline from what the robot was told. When any
+  micro-command saturates the cap, `StepResult.info["rate_limited"] =
+  True` surfaces that the executed motion lagged the action. Gripper
+  slots are normalized units and are EXCLUDED from the rad/s cap (they
+  are gated by the hand deadband instead). The cap is enforced in the
+  embodiment (safety backstop, independent of any Approver) in addition
+  to the absolute joint-limit clamp.
+- **Known limitation: the stream pauses between steps.** The rollout
+  applies no pacing outside `step()`, so policy inference (a 3B model
+  over HTTP, hundreds of ms) stalls the command stream once per chunk;
+  interpolation cannot fix that and v1 deliberately has no keep-alive
+  thread. The README safety section carries an on-robot verification
+  item: confirm the controller holds position during inference pauses
+  and re-enters tracking smoothly, e-stop staffed. The first
+  micro-command after any pause is delta-capped against the last
+  published command, bounding the resume jerk. If hardware turns out to
+  FAULT on gap violations (drops out of servo state rather than
+  holding), that evidence forces a background keep-alive thread in v2;
+  the plan records this as the explicit reversal trigger.
 - Policy `control_hz=None` (zero-warnings property), embodiment declares
   `SELF_PACED` and paces inside `step()`.
 
@@ -308,19 +358,29 @@ network, no stdin)
   gripper_to_counts/counts_to_gripper inversion with asymmetric values +
   clipping.
 - test_config.py: from_kwargs rejection, tuple parsing, validation cases
-  (stream/control ratio, pose-in-limits, url rejection on Go1Config).
-- test_embodiment.py: inert init; lazy connect; mode client called (and
-  skipped when require_servo_mode=False); homing ramp micro-command count
-  and rate cap; clamp backstop; interpolation correctness (hand-computed
-  micro-targets); per-micro-command delta cap; hand counts conversion at
-  the boundary (asymmetric); thumb swing held; pacing with injected clock;
-  camera passthrough; operator success/failure; unattended; close
-  idempotency + arm-only park + disconnect-on-error; bind_task; docs
-  labels; RUNTIME_REQUIREMENTS Mapping reported by
+  (pose-in-limits, url rejection on Go1Config), and the regression lock:
+  `A2Config()` constructs with pure defaults (home/rest inside limits,
+  ceil micro-command rule applies to the defaults).
+- test_embodiment.py: inert init; lazy connect; mode client called with
+  the documented SetAction body and POLLS GetAction until the target
+  state (and skipped when require_servo_mode=False); homing ramp
+  micro-command count and rate cap; clamp backstop; interpolation
+  correctness (hand-computed micro-targets, n=ceil rule); per-micro-
+  command delta cap relative to last PUBLISHED command; cross-step
+  continuity after a rate-saturated step (step N saturates, step N+1's
+  first micro-command is continuous with the last published value) and
+  info["rate_limited"] surfacing; gripper slots excluded from the rad/s
+  cap; hand counts conversion at the boundary (asymmetric); 12-slot wire
+  order thumb-swing-first and 5-flexion-joint mean (swing excluded);
+  thumb swing held; pacing with injected clock; camera passthrough;
+  operator success/failure; unattended; close idempotency + arm-only
+  park + disconnect-on-error; bind_task; docs labels;
+  RUNTIME_REQUIREMENTS Mapping reported by
   conformance.missing_runtime_requirements.
-- test_policy.py (both policies): wire payload keys byte-exact; state
-  reorder/polarity conversions both directions (asymmetric); shape/
-  emptiness/finiteness validation; truncation; instruction threading;
+- test_policy.py (both policies): wire payload keys byte-exact incl.
+  ctrl_freqs as np.asarray([30]); BARE-list response parsing; gripper
+  polarity conversion both directions (asymmetric); shape/emptiness/
+  finiteness validation; truncation; instruction threading;
   num_inferences; PolicyConfig wiring (replan_interval, no api_key in
   asdict); openpi pass-through (no integration, no flip).
 - test_operator.py, test_preflight.py (incl. dry_run key in --json),
