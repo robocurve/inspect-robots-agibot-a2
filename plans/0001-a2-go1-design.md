@@ -217,18 +217,25 @@ float` implementing the inversion+scale with clipping to [0, 2000].
   `head_cam_topic`, `left_cam_topic`, `right_cam_topic` (defaults = the
   documented A2 Ultra names; the whole topic map is config so variants
   remap without code), `domain_id=232`, `control_hz=30.0`,
-  `stream_hz=100.0` (must be an integer multiple >= control_hz; validated),
+  `stream_hz=100.0` (no integer-multiple constraint: `n =
+  ceil(stream_hz/control_hz)` micro-commands per step is the spec;
+  validated instead as `1/(control_hz * n) <= 0.03` so the documented
+  maximum command gap holds),
   `joint_low/joint_high` (documented defaults), `home_pose` (reset ramps
   here), `rest_pose=None` (close-time park, arm-only ramp),
   `max_joint_speed=3.0` (rad/s, the documented limit; used for the
   per-micro-command delta cap AND the reset/park ramp rate),
   `thumb_swing_count=0`, `hand_torque=2000` (counts, conservative default
-  well under the 5700 max), `unattended=False`, `docs_extra=""`,
-  `require_servo_mode=True` (see mode client). `__post_init__` validates
-  ranges, ordering, pose-in-limits, stream/control ratio.
+  well under the 5700 max), `hand_deadband=0.05` (normalized; hand
+  counts are republished only when a hand's commanded normalized target
+  moves more than this from the last-sent value, franka's gripper-gating
+  pattern; per-hand tracking, tested), `unattended=False`,
+  `docs_extra=""`, `require_servo_mode=True` (see mode client).
+  `__post_init__` validates ranges, ordering, pose-in-limits, and the
+  command-gap bound above.
 - `Go1Config` (frozen): `server_url="http://127.0.0.1:9000"`,
-  `endpoint="/act"`, `action_horizon=30` (verify against GO-1's advertised
-  chunk length at implementation; metadata), `replan_interval=None`
+  `endpoint="/act"`, `action_horizon=30` (GO-1's verified chunk length: action_chunk_size=30
+  in go1_base_cfg.py; metadata), `replan_interval=None`
   (GO-1's own runtime executes full chunks; leave framework default),
   `name="go1"`, `ctrl_freqs=30` (wire field). `.url` property joins
   server_url+endpoint; `from_kwargs` rejects `url` (yam convention).
@@ -251,11 +258,14 @@ float` implementing the inversion+scale with clipping to [0, 2000].
   `disconnect() -> None`.
 - `ModeClient` Protocol, injected via `mode_client` (separate seam):
   `set_action(state: str) -> None`, `get_action() -> str`. Default
-  `_default_mode_client` (pragma'd): `requests.post` JSON-RPC against
-  `mode_rpc_url` with the PROVISIONAL body shape documented inline and in
-  the README as needing on-robot confirmation; raises a guided error on
-  non-200. `require_servo_mode=False` skips mode assertion entirely (for
-  rigs where the operator sets the mode out of band).
+  `_default_mode_client` (pragma'd): thin `requests.post` mapping of the
+  two RPCs using the documented v1.3 body (cited to the AimDK
+  motion-control page; README carries the software-version caveat for
+  the v2.1 churn); raises a guided error on non-200. THE EMBODIMENT owns
+  the bounded GetAction poll loop (uses its injected sleep_fn; tested
+  against a fake ModeClient); the client is deliberately loop-free.
+  `require_servo_mode=False` skips mode assertion entirely (for rigs
+  where the operator sets the mode out of band).
 - `A2Embodiment`: inert `__init__(config=None, *, driver_factory=None,
   mode_client=None, operator=None, poll_end=None, clock=None,
   sleep_fn=None, **flat)`. Lazy connect at first `reset()`:
@@ -264,13 +274,19 @@ float` implementing the inversion+scale with clipping to [0, 2000].
   micro-commands, same path as step streaming), operator stand-clear +
   `wait_ready()` (skipped when unattended), return first observation.
 - `step()`: `validate_dim` -> clamp to joint_low/high (backstop) ->
-  interpolate from last commanded target to the clamped target in
-  `stream_hz/control_hz` micro-commands, each additionally delta-capped at
-  `max_joint_speed/stream_hz` per joint, publishing arm (14) and hand
-  (12 counts from the two gripper slots + thumb_swing_count) each
-  micro-tick, paced by injected sleep -> observe -> `poll_end()` /
+  interpolate from the LAST PUBLISHED command to the clamped target in
+  `n = ceil(stream_hz/control_hz)` micro-commands, each delta-capped at
+  `max_joint_speed/(control_hz * n)` per revolute joint (gripper slots
+  excluded), publishing arm (14) each micro-tick paced at
+  `1/(control_hz * n)` by the injected sleep; hand counts (12, from the
+  two gripper slots + thumb_swing_count) are published once per step,
+  gated by `hand_deadband` -> observe -> `poll_end()` /
   `confirm_success()` -> `StepResult` (success only via
-  `termination_reason="success"`).
+  `termination_reason="success"`; `info["rate_limited"]=True` when any
+  micro-command saturated). Baseline rule: at every connect/reset (and
+  before the close-time rest_pose park) the published-command baseline is
+  re-seeded from the freshly observed arm pose, so caps and ramps start
+  from where the arm actually is, never from a stale prior episode.
 - `close()`: idempotent; optional arm-only `rest_pose` ramp; disconnect
   always attempted; handle cleared on error.
 - `RUNTIME_REQUIREMENTS: ClassVar[Mapping[str, str]]` =
@@ -287,17 +303,17 @@ float` implementing the inversion+scale with clipping to [0, 2000].
 - `Go1Policy(config=None, *, post_fn=None, clock=None, **flat)`, entry
   point `go1`. `act()`: validate cameras (`head_cam/left_cam/right_cam`)
   and `joint_pos` state -> build the GO-1 wire payload: `top` = head_cam,
-  `left`/`right` = chest fisheyes, `instruction`, `state` = the 16-D vector
-  reordered to GO-1's expected proprio layout (14 arm + 2 effector, with
-  gripper polarity converted to GO-1's convention; implementer pins the
-  exact layout and polarity from AgiBot-World's deploy/eval code and
-  documents both in config.py docstrings), `ctrl_freqs` -> `post_fn(url,
-  payload) -> {"actions": (N, 16-compatible)}` -> convert back to the wire
-  contract (polarity, ordering) -> validate shape/emptiness/finiteness ->
-  truncate to `action_horizon` -> `ActionChunk(control_hz=30.0,
-  inference_latency_s=measured)`.
-  `_default_post` (pragma'd): requests JSON POST; image encoding per
-  AgiBot-World deploy.py (verified at implementation).
+  `left`/`right` = chest fisheyes, `instruction`, `state` = the 16-D
+  vector PASSED THROUGH VERBATIM (our packing order and polarity are the
+  normative A2 fine-tune convention; no reorder, no polarity conversion),
+  `ctrl_freqs` = `np.asarray([cfg.ctrl_freqs])` -> `post_fn(url, payload)
+  -> np.ndarray` (parses the BARE JSON list response) -> validate
+  shape/emptiness/finiteness -> truncate to `action_horizon` ->
+  `ActionChunk(control_hz=30.0, inference_latency_s=measured)`.
+  `_default_post` (pragma'd): `requests.post` with the whole payload
+  json_numpy-encoded (the server runs `json_numpy.patch()`); response
+  parsed with `np.asarray(resp.json())`. All wire facts hardcoded; no
+  implementation-time re-verification.
 - `OpenpiPolicy`: franka's adapter reshaped to 16-D: same DROID-free
   absolute-position semantics (no velocity integration, no polarity flip
   unless the A2 fine-tune convention requires one; default is
@@ -327,15 +343,17 @@ float` implementing the inversion+scale with clipping to [0, 2000].
 
 ## pyproject
 
-- Base deps: `inspect-robots>=0.12`, `numpy>=1.24`, `requests>=2.31`
-  (lazily imported transport, yam pattern). No ROS extra exists (system
-  install only); no openpi extra (git-only client, guided install).
+- Base deps: `inspect-robots>=0.12`, `numpy>=1.24`, `requests>=2.31`,
+  `json-numpy>=2.1` (lazily imported transports, yam pattern). No ROS
+  extra exists (system install only); no openpi extra (git-only client,
+  guided install).
 - dev extra: pytest, pytest-cov, ruff, mypy, pre-commit, numpy<2.5.
 - Entry points: embodiment `a2_arms = ...:A2Embodiment`; policies
   `go1 = ...:Go1Policy`, `openpi = ...:OpenpiPolicy`. Console script
   `inspect-robots-agibot-a2-preflight`.
 - mypy strict py3.10; overrides: `rclpy.*`, `sensor_msgs.*`,
-  `builtin_interfaces.*`, `requests.*`, `openpi_client.*`.
+  `builtin_interfaces.*`, `requests.*`, `json_numpy.*`,
+  `openpi_client.*`.
 - Everything else identical to franka (hatch-vcs, fancy-pypi-readme, ruff
   D1 set, coverage 100 branch).
 
@@ -344,8 +362,8 @@ float` implementing the inversion+scale with clipping to [0, 2000].
 franka's skeleton minus the openpi-seam job's franka-specific bits:
 `quality`, `test` (ubuntu+macos x py3.11/3.12, locked, 100%),
 `import-hygiene` (--no-deps + locked inspect-robots/numpy pins; assert
-`requests`, `rclpy`, `openpi_client`, `websockets`, `torch` absent; import
-package), `openpi-seam` (same as franka: git-URL install + signature
+`requests`, `json_numpy`, `rclpy`, `openpi_client`, `websockets`, `torch`
+absent; import package), `openpi-seam` (same as franka: git-URL install + signature
 assertions; the openpi client is a real dependency of the second policy's
 default transport), `ci-ok` aggregate needing all four, `alert-red-main`.
 canary.yml + release.yml byte-copied. Branch ruleset already active.
@@ -378,11 +396,13 @@ network, no stdin)
   RUNTIME_REQUIREMENTS Mapping reported by
   conformance.missing_runtime_requirements.
 - test_policy.py (both policies): wire payload keys byte-exact incl.
-  ctrl_freqs as np.asarray([30]); BARE-list response parsing; gripper
-  polarity conversion both directions (asymmetric); shape/emptiness/
-  finiteness validation; truncation; instruction threading;
-  num_inferences; PolicyConfig wiring (replan_interval, no api_key in
-  asdict); openpi pass-through (no integration, no flip).
+  ctrl_freqs as np.asarray([30]); BARE-list response parsing; the 16-D
+  state passes through VERBATIM (asymmetric vector, byte-equal
+  assertion; no reorder, no polarity change); shape/emptiness/finiteness
+  validation; truncation; instruction threading; num_inferences;
+  PolicyConfig wiring (replan_interval, no api_key in asdict); openpi
+  pass-through (no integration, no flip); hand deadband gating tested on
+  the embodiment side.
 - test_operator.py, test_preflight.py (incl. dry_run key in --json),
   test_ros.py (loader guidance message; image conversion helper: rgb8,
   bgr8, big-endian rejection, wrong-encoding error).
@@ -400,8 +420,8 @@ network, no stdin)
 
 Sections: badges/intro (three registered components, sibling links),
 Install (client machine: pip package; robot side: system ROS 2 Humble env
-vars + FastRTPS profile + disable_motion_player + SetAction mode notes with
-the provisional-JSON caveat; GPU machine: GO-1 deploy.py serve command +
+vars + FastRTPS profile + DisableMotionPlayer curl (port 56444) + SetAction mode notes with
+the documented v1.3 body and the software-version caveat; GPU machine: GO-1 deploy.py serve command +
 CC BY-NC-SA license note), Preflight, Run on hardware (config.ini with
 topic overrides), Safety (clamp + rate cap + interpolation explanation,
 gripper collapse semantics, mode-gating warning, no-wrist-camera caveat for
