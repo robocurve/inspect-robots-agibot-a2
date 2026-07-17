@@ -1,6 +1,6 @@
 # 0001: AgiBot A2 embodiment + GO-1/openpi policy plugin
 
-Status: draft (critique loop in progress)
+Status: accepted after three adversarial critique rounds (2026-07-17)
 Issue: #1
 
 ## Goal
@@ -45,9 +45,9 @@ DROID-style conversions).
   "ControlSource_SAFE"}, "command": {"action": "McAction_USE_EXT_CMD",
   "ext_action": "<state>"}}`. `mode_rpc_url` is the BASE url; the client
   joins `/rpc/aimdk.protocol.McActionService/<method>` itself. SetAction
-  is asynchronous: the default client polls `GetAction` until the target
-  state is reached (bounded retries, injected sleep) instead of
-  fire-and-forget. Separately, the built-in motion player must be
+  is asynchronous: the embodiment polls `GetAction` (through the mode
+  client) until the target state is reached (bounded retries, injected
+  sleep) instead of fire-and-forget. Separately, the built-in motion player must be
   disabled; that is its own documented RPC on a DIFFERENT port
   (`POST http://192.168.100.100:56444/rpc/aimdk.protocol.MotionCommandService/DisableMotionPlayer`
   with `{}`): the README robot-setup section shows the curl, and the
@@ -378,10 +378,12 @@ network, no stdin)
 - test_config.py: from_kwargs rejection, tuple parsing, validation cases
   (pose-in-limits, url rejection on Go1Config), and the regression lock:
   `A2Config()` constructs with pure defaults (home/rest inside limits,
-  ceil micro-command rule applies to the defaults).
+  command-gap bound 1/(control_hz*n) <= 0.03 holds with defaults).
 - test_embodiment.py: inert init; lazy connect; mode client called with
-  the documented SetAction body and POLLS GetAction until the target
-  state (and skipped when require_servo_mode=False); homing ramp
+  the documented SetAction body; the embodiment polls GetAction via the
+  fake client until the target state (and skipped when
+  require_servo_mode=False); hand deadband gating (per-hand, asymmetric
+  moves); homing ramp
   micro-command count and rate cap; clamp backstop; interpolation
   correctness (hand-computed micro-targets, n=ceil rule); per-micro-
   command delta cap relative to last PUBLISHED command; cross-step
