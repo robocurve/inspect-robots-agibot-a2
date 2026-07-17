@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "Inspect Robots AgiBot A2: GO-1 and openpi adapters for A2 arms"
+authors:
+  - name: "RoboCurve"
+type: software
+license: MIT
+repository-code: "https://github.com/robocurve/inspect-robots-agibot-a2"
+version: "0.1.0"
