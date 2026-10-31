@@ -25,7 +25,7 @@ This repository is a sibling of
 
 ### Client machine
 
-Python 3.10 or newer is required.
+Python 3.11 or newer is required.
 
 ```bash
 pip install inspect-robots-agibot-a2
